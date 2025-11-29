@@ -20,6 +20,17 @@ from makeParallel import (
     parallel_pool,
     memoize_fast,
     parallel_map,
+
+    # Advanced features
+    parallel_priority,
+    profiled,
+    get_metrics,
+    get_all_metrics,
+    reset_all_metrics,
+    shutdown,
+    initialize,
+    configure_thread_pool,
+    get_thread_pool_info,
 )
 
 class TestRunner:
@@ -515,6 +526,113 @@ def test_edge_large_data(t):
     t.assert_equal(len(result), 1000)
     t.assert_equal(result[0], 0)
     t.assert_equal(result[-1], 999)
+
+# =============================================================================
+# TEST 14: Advanced Features
+# =============================================================================
+@runner.test("Advanced - AsyncHandle.cancel()")
+def test_advanced_cancel(t):
+    @parallel
+    def long_running_task():
+        time.sleep(2)
+        return "should not complete"
+
+    handle = long_running_task()
+    time.sleep(0.1)
+    handle.cancel()
+
+    t.assert_true(handle.is_cancelled(), "handle.is_cancelled() should be True.")
+    t.assert_raises(Exception, handle.get)
+
+@runner.test("Advanced - Task timeout")
+def test_advanced_timeout(t):
+    @parallel
+    def task_that_will_timeout():
+        time.sleep(1)
+        return "should have timed out"
+
+    handle = task_that_will_timeout(timeout=0.5)
+    t.assert_raises(Exception, handle.get)
+
+@runner.test("Advanced - Task metadata")
+def test_advanced_metadata(t):
+    @parallel
+    def task_with_metadata(x):
+        return x
+
+    handle = task_with_metadata(123)
+    handle.set_metadata("user_id", "user-abc")
+    handle.set_metadata("request_id", "req-123")
+    metadata = handle.get_all_metadata()
+
+    t.assert_equal(metadata.get("user_id"), "user-abc")
+    t.assert_equal(metadata.get("request_id"), "req-123")
+
+@runner.test("Advanced - Thread pool configuration")
+def test_advanced_threadpool_config(t):
+    configure_thread_pool(num_threads=4)
+    info = get_thread_pool_info()
+    t.assert_equal(info['num_threads'], 4)
+    # Reset to default
+    configure_thread_pool(num_threads=0)
+
+@runner.test("Advanced - @parallel_priority")
+def test_advanced_priority(t):
+    start_time = time.time()
+    @parallel_priority
+    def priority_task(priority):
+        time.sleep(0.2)
+        return time.time() - start_time, priority
+
+    low_prio_handle = priority_task(1, priority=1)
+    time.sleep(0.01)
+    high_prio_handle = priority_task(10, priority=10)
+
+    low_prio_time, _ = low_prio_handle.get()
+    high_prio_time, _ = high_prio_handle.get()
+
+    t.assert_true(high_prio_time < low_prio_time, "High priority task should finish first")
+
+@runner.test("Advanced - @profiled and metrics")
+def test_advanced_profiling(t):
+    reset_all_metrics()
+
+    @profiled
+    def profiled_func(n):
+        time.sleep(0.05)
+        return n * 2
+
+    for i in range(3):
+        profiled_func(i)
+
+    metrics = get_metrics("profiled_func")
+    t.assert_equal(metrics.total_tasks, 3)
+    t.assert_equal(metrics.completed_tasks, 3)
+
+    all_metrics = get_all_metrics()
+    t.assert_true("profiled_func" in all_metrics)
+
+# This test is last as it can interfere with other tests
+@runner.test("Advanced - Graceful shutdown")
+def test_advanced_shutdown(t):
+    # Re-initialize the runtime for this test
+    initialize()
+
+    @parallel
+    def task_for_shutdown():
+        time.sleep(1)
+        return "done"
+
+    handles = [task_for_shutdown() for _ in range(3)]
+    time.sleep(0.1)
+    shutdown_success = shutdown(timeout_secs=0.5, cancel_pending=True)
+    t.assert_equal(shutdown_success, False)
+
+    # We expect the handles to be cancelled
+    t.assert_raises(Exception, handles[0].get)
+
+    # Reset the runtime after shutdown
+    initialize()
 
 # =============================================================================
 # Run all tests
