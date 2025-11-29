@@ -51,10 +51,10 @@ class TestRunner:
             try:
                 print(f"\n[TEST] {name}...", end=" ")
                 test_func(self)
-                print("✓ PASSED")
+                print(" PASSED")
                 self.passed += 1
             except Exception as e:
-                print(f"✗ FAILED")
+                print(f" FAILED")
                 print(f"  Error: {e}")
                 self.failed += 1
 
