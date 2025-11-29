@@ -867,15 +867,16 @@ impl AsyncHandle {
         }
     }
 
-    /// Cancel the operation (try to join the thread)
+    /// Cancel the operation (non-blocking - just sets the flag)
     fn cancel(&self) -> PyResult<()> {
         // Set cancellation flag
         self.cancel_token.store(true, Ordering::SeqCst);
 
-        let mut handle = self.thread_handle.lock().unwrap();
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
+        // Mark as complete to prevent further waits
+        *self.is_complete.lock().unwrap() = true;
+
+        // Don't join the thread - that would block!
+        // The thread will check the flag and exit on its own
         Ok(())
     }
 
