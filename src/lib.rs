@@ -311,13 +311,31 @@ fn start_priority_worker(py: Python) -> PyResult<()> {
 
                 if let Some(task) = task_opt {
                     Python::attach(|py| {
+                        let exec_start = Instant::now();
+
+                        // Get function name for profiling
+                        let func_name = task.func
+                            .bind(py)
+                            .getattr("__name__")
+                            .ok()
+                            .and_then(|n| n.extract::<String>().ok())
+                            .unwrap_or_else(|| "unknown".to_string());
+
                         let result = task.func
                             .bind(py)
                             .call(task.args.bind(py), task.kwargs.as_ref().map(|k| k.bind(py)));
 
+                        let exec_time = exec_start.elapsed().as_secs_f64() * 1000.0; // Convert to ms
+
                         let to_send = match result {
-                            Ok(val) => Ok(val.unbind()),
-                            Err(e) => Err(e),
+                            Ok(val) => {
+                                record_task_execution(&func_name, exec_time, true);
+                                Ok(val.unbind())
+                            }
+                            Err(e) => {
+                                record_task_execution(&func_name, exec_time, false);
+                                Err(e)
+                            }
                         };
 
                         let _ = task.sender.send(to_send);
@@ -1464,20 +1482,67 @@ struct PriorityParallelWrapper {
 
 #[pymethods]
 impl PriorityParallelWrapper {
-    #[pyo3(signature = (*args, priority=0, **kwargs))]
+    #[pyo3(signature = (*args, priority=0, timeout=None, **kwargs))]
     fn __call__(
         &self,
         py: Python,
         args: &Bound<'_, PyTuple>,
         priority: i32,
+        timeout: Option<f64>,
         kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Py<AsyncHandleFast>> {
+    ) -> PyResult<Py<AsyncHandle>> {
+        // Check if shutdown is requested
+        if is_shutdown_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Cannot start new tasks: shutdown in progress"
+            ));
+        }
+
+        // Wait for available slot (backpressure)
+        wait_for_slot();
+
+        // Check memory before starting
+        if !check_memory_ok() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Memory limit reached, cannot start new task"
+            ));
+        }
+
         let func = self.func.clone_ref(py);
+
+        // Generate unique task ID
+        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let task_id_clone = task_id.clone();
+
+        // Register task as active
+        register_task(task_id.clone());
+
+        // Get function name for profiling
+        let func_name = func
+            .bind(py)
+            .getattr("__name__")
+            .ok()
+            .and_then(|n| n.extract::<String>().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+
         let args_py: Py<PyTuple> = args.clone().unbind();
         let kwargs_py: Option<Py<PyDict>> = kwargs.map(|k| k.clone().unbind());
 
+        // Use crossbeam channel for priority queue
         let (sender, receiver) = unbounded();
+
         let is_complete = Arc::new(Mutex::new(false));
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let start_time = Instant::now();
+
+        // Setup timeout if specified
+        if let Some(timeout_secs) = timeout {
+            let cancel_token_timeout = cancel_token.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs_f64(timeout_secs));
+                cancel_token_timeout.store(true, Ordering::SeqCst);
+            });
+        }
 
         // Create priority task
         let task = PriorityTask {
@@ -1496,10 +1561,45 @@ impl PriorityParallelWrapper {
             start_priority_worker(py)?;
         }
 
-        let async_handle = AsyncHandleFast {
-            receiver: Arc::new(Mutex::new(receiver)),
+        // Create full AsyncHandle with all features
+        let async_handle = AsyncHandle {
+            receiver: Arc::new(Mutex::new({
+                // Convert crossbeam receiver to std::sync::mpsc receiver
+                // We need to spawn a helper thread to bridge the two channel types
+                let (std_sender, std_receiver): (Sender<PyResult<Py<PyAny>>>, Receiver<PyResult<Py<PyAny>>>) = channel();
+                let is_complete_clone = is_complete.clone();
+
+                thread::spawn(move || {
+                    match receiver.recv() {
+                        Ok(result) => {
+                            let _ = std_sender.send(result);
+                            *is_complete_clone.lock().unwrap() = true;
+                            unregister_task(&task_id_clone);
+                        }
+                        Err(_) => {
+                            let _ = std_sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                "Priority task channel closed unexpectedly"
+                            )));
+                            *is_complete_clone.lock().unwrap() = true;
+                            unregister_task(&task_id_clone);
+                        }
+                    }
+                });
+
+                std_receiver
+            })),
+            thread_handle: Arc::new(Mutex::new(None)), // Priority tasks don't have individual thread handles
             is_complete,
             result_cache: Arc::new(Mutex::new(None)),
+            cancel_token,
+            func_name,
+            start_time,
+            task_id,
+            metadata: Arc::new(Mutex::new(HashMap::new())),
+            timeout,
+            on_complete: Arc::new(Mutex::new(None)),
+            on_error: Arc::new(Mutex::new(None)),
+            on_progress: Arc::new(Mutex::new(None)),
         };
 
         Py::new(py, async_handle)
@@ -1696,7 +1796,7 @@ fn retry_backoff(
 
 /// This module is implemented in Rust.
 #[pymodule]
-fn makeParallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn makeparallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Original decorators
     m.add_function(wrap_pyfunction!(timer, m)?)?;
     m.add_function(wrap_pyfunction!(log_calls, m)?)?;

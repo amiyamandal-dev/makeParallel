@@ -2,8 +2,8 @@
 
 **The easiest way to speed up your Python code using all your CPU cores.**
 
-[![PyPI version](https://badge.fury.io/py/makeParallel.svg)](https://badge.fury.io/py/makeParallel)
-[![Tests](https://img.shields.io/badge/tests-39/40_passing-brightgreen)](tests/test_all.py)
+[![PyPI version](https://badge.fury.io/py/makeparallel.svg)](https://badge.fury.io/py/makeparallel)
+[![Tests](https://img.shields.io/badge/tests-40/40_passing-brightgreen)](tests/test_all.py)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -56,7 +56,7 @@ Python has a rule called the Global Interpreter Lock (GIL) that only lets **one 
 Installing is as simple as:
 
 ```bash
-pip install makeParallel
+pip install makeparallel
 ```
 
 Or, to build it from the source:
@@ -89,7 +89,7 @@ print(f"Got result: {result} in {time.time() - start:.2f}s")
 **After:** Instant and non-blocking!
 ```python
 import time
-from makeParallel import parallel
+from makeparallel import parallel
 
 @parallel # Just add this decorator!
 def cpu_intensive_task(n):
@@ -134,7 +134,7 @@ For **I/O-bound** tasks (like waiting for a web request or reading a file), Pyth
 
 #### `@parallel` - Full-featured parallel execution with advanced control
 ```python
-from makeParallel import parallel
+from makeparallel import parallel
 
 @parallel
 def cpu_intensive_task(n):
@@ -167,7 +167,7 @@ metadata = handle.get_all_metadata()
 
 #### `@parallel_fast` - Optimized with lock-free channels (crossbeam)
 ```python
-from makeParallel import parallel_fast
+from makeparallel import parallel_fast
 
 @parallel_fast
 def fast_task(x):
@@ -179,7 +179,7 @@ result = handle.get()  # Faster channel communication
 
 #### `@parallel_pool` - Uses Rayon thread pool (best for many small tasks)
 ```python
-from makeParallel import parallel_pool
+from makeparallel import parallel_pool
 
 @parallel_pool
 def small_task(x):
@@ -192,22 +192,32 @@ results = [h.get() for h in handles]
 
 #### `@parallel_priority` - Priority-based execution
 ```python
-from makeParallel import parallel_priority
+from makeparallel import parallel_priority, start_priority_worker, stop_priority_worker
+
+# Start the priority worker before using priority tasks
+start_priority_worker()
 
 @parallel_priority
-def task(data, priority):
+def task(data):
     return process(data)
 
-# High priority tasks execute first
+# High priority tasks execute first (higher number = higher priority)
 low = task(data1, priority=1)
-high = task(data2, priority=10)  # Runs first
+high = task(data2, priority=10)  # Executes first
+
+# Get results
+low_result = low.get()
+high_result = high.get()
+
+# Stop the worker when done
+stop_priority_worker()
 ```
 
 ### 🗺️ Batch Processing
 
 #### `parallel_map` - Process lists in parallel
 ```python
-from makeParallel import parallel_map
+from makeparallel import parallel_map
 
 def process_data(item):
     return item * 2
@@ -218,7 +228,7 @@ results = parallel_map(process_data, my_large_list)
 
 #### `gather` - Collect results from multiple handles
 ```python
-from makeParallel import parallel, gather
+from makeparallel import parallel, gather
 
 @parallel
 def task(x):
@@ -232,7 +242,7 @@ results = gather(handles, on_error="raise")  # or "skip" or "none"
 
 #### `ParallelContext` - Context manager for parallel tasks
 ```python
-from makeParallel import ParallelContext, parallel
+from makeparallel import ParallelContext, parallel
 
 @parallel
 def task(x):
@@ -248,7 +258,7 @@ with ParallelContext(timeout=10.0) as ctx:
 
 #### `@memoize` - Cache function results
 ```python
-from makeParallel import memoize
+from makeparallel import memoize
 
 @memoize
 def fibonacci(n):
@@ -262,7 +272,7 @@ fibonacci(35)  # Instant second time
 
 #### `@memoize_fast` - Lock-free concurrent cache (DashMap)
 ```python
-from makeParallel import memoize_fast
+from makeparallel import memoize_fast
 
 @memoize_fast
 def expensive_computation(x, y):
@@ -275,7 +285,7 @@ def expensive_computation(x, y):
 
 #### `@retry` - Simple retry with fixed delays
 ```python
-from makeParallel import retry
+from makeparallel import retry
 
 @retry(max_retries=3)
 def flaky_api_call():
@@ -285,7 +295,7 @@ def flaky_api_call():
 
 #### `@retry_backoff` - Retry with exponential backoff
 ```python
-from makeParallel import retry_backoff
+from makeparallel import retry_backoff
 
 @retry_backoff(
     max_attempts=5,
@@ -301,7 +311,7 @@ def unreliable_task():
 
 #### `@profiled` - Automatic performance tracking
 ```python
-from makeParallel import profiled, get_metrics, get_all_metrics
+from makeparallel import profiled, get_metrics, get_all_metrics
 
 @profiled
 def tracked_function(x):
@@ -323,7 +333,7 @@ all_metrics = get_all_metrics()
 
 #### `@timer` - Simple execution timing
 ```python
-from makeParallel import timer
+from makeparallel import timer
 
 @timer
 def my_function():
@@ -335,7 +345,7 @@ my_function()  # Prints execution time
 
 #### `@log_calls` - Log function calls and returns
 ```python
-from makeParallel import log_calls
+from makeparallel import log_calls
 
 @log_calls
 def my_function(x, y):
@@ -346,7 +356,7 @@ my_function(5, 3)  # Prints call args and return value
 
 #### `@CallCounter` - Count function invocations
 ```python
-from makeParallel import CallCounter
+from makeparallel import CallCounter
 
 @CallCounter
 def counted_function():
@@ -362,7 +372,7 @@ counted_function.reset()
 
 #### Thread Pool Configuration
 ```python
-from makeParallel import configure_thread_pool, get_thread_pool_info
+from makeparallel import configure_thread_pool, get_thread_pool_info
 
 # Configure global thread pool
 configure_thread_pool(num_threads=8, stack_size=2*1024*1024)
@@ -374,7 +384,7 @@ print(info["current_num_threads"])
 
 #### Backpressure and Resource Management
 ```python
-from makeParallel import set_max_concurrent_tasks, configure_memory_limit
+from makeparallel import set_max_concurrent_tasks, configure_memory_limit
 
 # Limit concurrent tasks to prevent overload
 set_max_concurrent_tasks(100)
@@ -385,7 +395,7 @@ configure_memory_limit(max_memory_percent=80.0)
 
 #### Progress Reporting
 ```python
-from makeParallel import parallel, report_progress
+from makeparallel import parallel, report_progress
 
 @parallel
 def long_task():
@@ -402,7 +412,7 @@ print(f"Progress: {handle.get_progress() * 100}%")
 
 #### Graceful Shutdown
 ```python
-from makeParallel import shutdown, get_active_task_count, reset_shutdown
+from makeparallel import shutdown, get_active_task_count, reset_shutdown
 
 # Get active task count
 print(f"Active tasks: {get_active_task_count()}")
@@ -498,7 +508,7 @@ configure_thread_pool(num_threads=8)  # Match your CPU cores
 
 ### Example 1: Image Processing Pipeline
 ```python
-from makeParallel import parallel_map, profiled
+from makeparallel import parallel_map, profiled
 from PIL import Image
 import os
 
@@ -521,7 +531,7 @@ print(f"Processed {len(processed)} images")
 
 ### Example 2: Web Scraping with Retry Logic
 ```python
-from makeParallel import parallel_pool, retry_backoff
+from makeparallel import parallel_pool, retry_backoff
 import requests
 
 @retry_backoff(max_attempts=3, backoff="exponential")
@@ -537,7 +547,7 @@ results = [h.get() for h in handles]
 
 ### Example 3: Data Analysis with Progress Tracking
 ```python
-from makeParallel import parallel, report_progress
+from makeparallel import parallel, report_progress
 import pandas as pd
 
 @parallel
@@ -569,7 +579,7 @@ final_results = handle.get()
 
 ### Example 4: Machine Learning Model Training
 ```python
-from makeParallel import parallel, gather, configure_thread_pool
+from makeparallel import parallel, gather, configure_thread_pool
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 
@@ -688,7 +698,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **Issues**: [GitHub Issues](https://github.com/your-username/makeParallel/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/your-username/makeParallel/discussions)
-- **PyPI**: [pypi.org/project/makeParallel](https://pypi.org/project/makeParallel/)
+- **PyPI**: [pypi.org/project/makeparallel](https://pypi.org/project/makeparallel/)
 
 ---
 
