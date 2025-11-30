@@ -4,7 +4,7 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -15,44 +15,13 @@ use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSende
 use dashmap::DashMap;
 use rayon::prelude::*;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;  // Faster mutex implementation
 
-// =============================================================================
-// ERROR HANDLING
-// =============================================================================
+// Module imports
+mod types;
+use types::TaskError as CustomTaskError;
 
-/// Enhanced error information for task failures
-#[pyclass]
-#[derive(Clone)]
-struct TaskError {
-    #[pyo3(get)]
-    task_name: String,
-    #[pyo3(get)]
-    elapsed_time: f64,
-    #[pyo3(get)]
-    error_message: String,
-    #[pyo3(get)]
-    error_type: String,
-    #[pyo3(get)]
-    task_id: String,
-}
-
-#[pymethods]
-impl TaskError {
-    fn __str__(&self) -> String {
-        format!(
-            "TaskError in '{}' (task_id: {}, elapsed: {}s): {} ({})",
-            self.task_name, self.task_id, self.elapsed_time, self.error_message, self.error_type
-        )
-    }
-
-    fn __repr__(&self) -> String {
-        self.__str__()
-    }
-}
-
-// =============================================================================
-// GRACEFUL SHUTDOWN
-// =============================================================================
+type TaskError = CustomTaskError;
 
 /// Global shutdown flag
 static SHUTDOWN_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
@@ -70,19 +39,19 @@ fn is_shutdown_requested() -> bool {
 
 /// Register a task as active
 fn register_task(task_id: String) {
-    ACTIVE_TASKS.lock().unwrap().push(task_id);
+    ACTIVE_TASKS.lock().push(task_id);
 }
 
 /// Unregister a task
 fn unregister_task(task_id: &str) {
-    let mut tasks = ACTIVE_TASKS.lock().unwrap();
+    let mut tasks = ACTIVE_TASKS.lock();
     tasks.retain(|id| id != task_id);
 }
 
 /// Get active task count
 #[pyfunction]
 fn get_active_task_count() -> usize {
-    ACTIVE_TASKS.lock().unwrap().len()
+    ACTIVE_TASKS.lock().len()
 }
 
 /// Initiate graceful shutdown
@@ -125,10 +94,6 @@ fn reset_shutdown() -> PyResult<()> {
     Ok(())
 }
 
-// =============================================================================
-// BACKPRESSURE AND RATE LIMITING
-// =============================================================================
-
 /// Global concurrent task limit
 static MAX_CONCURRENT_TASKS: Lazy<Arc<Mutex<Option<usize>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -136,13 +101,13 @@ static MAX_CONCURRENT_TASKS: Lazy<Arc<Mutex<Option<usize>>>> =
 /// Set maximum concurrent tasks
 #[pyfunction]
 fn set_max_concurrent_tasks(max_tasks: usize) -> PyResult<()> {
-    *MAX_CONCURRENT_TASKS.lock().unwrap() = Some(max_tasks);
+    *MAX_CONCURRENT_TASKS.lock() = Some(max_tasks);
     Ok(())
 }
 
 /// Wait for available slot (backpressure)
 fn wait_for_slot() {
-    if let Some(max) = *MAX_CONCURRENT_TASKS.lock().unwrap() {
+    if let Some(max) = *MAX_CONCURRENT_TASKS.lock() {
         while get_active_task_count() >= max {
             thread::sleep(Duration::from_millis(10));
         }
@@ -165,13 +130,13 @@ fn configure_memory_limit(max_memory_percent: f64) -> PyResult<()> {
             "max_memory_percent must be between 0 and 100"
         ));
     }
-    *MEMORY_LIMIT_PERCENT.lock().unwrap() = Some(max_memory_percent);
+    *MEMORY_LIMIT_PERCENT.lock() = Some(max_memory_percent);
     Ok(())
 }
 
 /// Check if memory usage is acceptable
 fn check_memory_ok() -> bool {
-    if let Some(_limit) = *MEMORY_LIMIT_PERCENT.lock().unwrap() {
+    if let Some(_limit) = *MEMORY_LIMIT_PERCENT.lock() {
         // In a real implementation, would check actual memory usage
         // For now, always return true
         // TODO: Add actual memory checking with sysinfo crate
@@ -228,7 +193,7 @@ fn configure_thread_pool(py: Python, num_threads: Option<usize>, stack_size: Opt
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build thread pool: {}", e))
         })?;
 
-        *CUSTOM_THREAD_POOL.lock().unwrap() = Some(pool);
+        *CUSTOM_THREAD_POOL.lock() = Some(pool);
         Ok(())
     })
 }
@@ -237,7 +202,7 @@ fn configure_thread_pool(py: Python, num_threads: Option<usize>, stack_size: Opt
 #[pyfunction]
 fn get_thread_pool_info(py: Python) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
-    let pool = CUSTOM_THREAD_POOL.lock().unwrap();
+    let pool = CUSTOM_THREAD_POOL.lock();
 
     if let Some(p) = pool.as_ref() {
         dict.set_item("configured", true)?;
@@ -305,7 +270,7 @@ fn start_priority_worker(py: Python) -> PyResult<()> {
         thread::spawn(move || {
             while PRIORITY_WORKER_RUNNING.load(Ordering::SeqCst) {
                 let task_opt = {
-                    let mut queue = PRIORITY_QUEUE.lock().unwrap();
+                    let mut queue = PRIORITY_QUEUE.lock();
                     queue.pop()
                 };
 
@@ -395,7 +360,7 @@ fn record_task_execution(name: &str, duration_ms: f64, success: bool) {
         FAILED_COUNTER.fetch_add(1, Ordering::SeqCst);
     }
 
-    let mut metrics = METRICS.lock().unwrap();
+    let mut metrics = METRICS.lock();
     let entry = metrics.entry(name.to_string()).or_insert(PerformanceMetrics {
         total_tasks: 0,
         completed_tasks: 0,
@@ -417,7 +382,7 @@ fn record_task_execution(name: &str, duration_ms: f64, success: bool) {
 /// Get performance metrics for a specific function
 #[pyfunction]
 fn get_metrics(name: String) -> PyResult<Option<PerformanceMetrics>> {
-    let metrics = METRICS.lock().unwrap();
+    let metrics = METRICS.lock();
     Ok(metrics.get(&name).cloned())
 }
 
@@ -425,7 +390,7 @@ fn get_metrics(name: String) -> PyResult<Option<PerformanceMetrics>> {
 #[pyfunction]
 fn get_all_metrics(py: Python) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
-    let metrics = METRICS.lock().unwrap();
+    let metrics = METRICS.lock();
 
     for (name, metric) in metrics.iter() {
         let metric_dict = PyDict::new(py);
@@ -447,7 +412,7 @@ fn get_all_metrics(py: Python) -> PyResult<Py<PyDict>> {
 /// Reset all metrics
 #[pyfunction]
 fn reset_metrics() -> PyResult<()> {
-    METRICS.lock().unwrap().clear();
+    METRICS.lock().clear();
     TASK_COUNTER.store(0, Ordering::SeqCst);
     COMPLETED_COUNTER.store(0, Ordering::SeqCst);
     FAILED_COUNTER.store(0, Ordering::SeqCst);
@@ -521,65 +486,6 @@ fn timer(py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
     Ok(method_wrapper.into())
 }
 
-// 2. Log Calls Decorator
-#[pyfunction]
-fn log_calls(py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let func_clone = func.clone_ref(py);
-    let wrapper = move |args: &Bound<'_, PyTuple>,
-                        kwargs: Option<&Bound<'_, PyDict>>|
-          -> PyResult<Py<PyAny>> {
-        let py = args.py();
-        let args_repr: Vec<String> = args
-            .iter()
-            .map(|arg| arg.repr().unwrap().to_str().unwrap().to_string())
-            .collect();
-        let kwargs_repr: Option<String> = kwargs.map(|d| {
-            d.iter()
-                .map(|(k, v)| format!("{}={}", k, v.repr().unwrap().to_str().unwrap()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        });
-
-        print!(
-            "Calling '{}' with args: ({})",
-            func_clone
-                .bind(py)
-                .getattr("__name__")?
-                .extract::<String>()?,
-            args_repr.join(", ")
-        );
-        if let Some(s) = kwargs_repr {
-            if !s.is_empty() {
-                print!(", kwargs: {{{}}}", s);
-            }
-        }
-        println!();
-
-        let result = func_clone.bind(py).call(args, kwargs)?;
-        println!(
-            "Function '{}' returned: {}",
-            func_clone
-                .bind(py)
-                .getattr("__name__")?
-                .extract::<String>()?,
-            result.repr()?.to_str()?
-        );
-        Ok(result.unbind())
-    };
-
-    let wrapped = PyCFunction::new_closure(py, None, None, wrapper)?;
-
-    // Wrap in MethodWrapper to support methods
-    let method_wrapper = Py::new(
-        py,
-        MethodWrapper {
-            func: func.clone_ref(py),
-            wrapper: wrapped.into(),
-        },
-    )?;
-    Ok(method_wrapper.into())
-}
-
 // 3. Call Counter Decorator (as a PyClass)
 #[pyclass(name = "CallCounter")]
 struct CallCounter {
@@ -604,18 +510,18 @@ impl CallCounter {
         args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        let mut count = self.call_count.lock().unwrap();
+        let mut count = self.call_count.lock();
         *count += 1;
         Ok(self.func.bind(py).call(args, kwargs)?.unbind())
     }
 
     #[getter]
     fn get_call_count(&self) -> PyResult<i32> {
-        Ok(*self.call_count.lock().unwrap())
+        Ok(*self.call_count.lock())
     }
 
     fn reset(&self) -> PyResult<()> {
-        *self.call_count.lock().unwrap() = 0;
+        *self.call_count.lock() = 0;
         Ok(())
     }
 
@@ -677,7 +583,7 @@ impl BoundMethod {
 
     #[getter]
     fn get_call_count(&self) -> PyResult<i32> {
-        Ok(*self.call_count.lock().unwrap())
+        Ok(*self.call_count.lock())
     }
 }
 
@@ -743,7 +649,7 @@ fn memoize(py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
         }
         let key = key_parts.join(",");
 
-        let mut cache_lock = cache.lock().unwrap();
+        let mut cache_lock = cache.lock();
 
         // Check if result is in cache
         if let Some(cached_result) = cache_lock.get(&key) {
@@ -787,13 +693,13 @@ struct AsyncHandle {
 impl AsyncHandle {
     /// Check if the result is ready (non-blocking)
     fn is_ready(&self) -> PyResult<bool> {
-        Ok(*self.is_complete.lock().unwrap())
+        Ok(*self.is_complete.lock())
     }
 
     /// Try to get the result without blocking (returns None if not ready)
     fn try_get(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         // Check cache first
-        let mut cache = self.result_cache.lock().unwrap();
+        let mut cache = self.result_cache.lock();
         if let Some(ref cached) = *cache {
             return match cached {
                 Ok(val) => Ok(Some(val.clone_ref(py))),
@@ -805,10 +711,10 @@ impl AsyncHandle {
         }
 
         // Try to receive without blocking
-        let receiver = self.receiver.lock().unwrap();
+        let receiver = self.receiver.lock();
         match receiver.try_recv() {
             Ok(result) => {
-                *self.is_complete.lock().unwrap() = true;
+                *self.is_complete.lock() = true;
                 match result {
                     Ok(val) => {
                         *cache = Some(Ok(val.clone_ref(py)));
@@ -829,7 +735,7 @@ impl AsyncHandle {
     /// Get the result (blocking until ready)
     fn get(&self, py: Python) -> PyResult<Py<PyAny>> {
         // Check cache first
-        let cache = self.result_cache.lock().unwrap();
+        let cache = self.result_cache.lock();
         if let Some(ref cached) = *cache {
             return match cached {
                 Ok(val) => Ok(val.clone_ref(py)),
@@ -844,15 +750,15 @@ impl AsyncHandle {
         // CRITICAL: Release GIL before blocking on recv to avoid deadlock
         let result = py
             .detach(|| {
-                let receiver = self.receiver.lock().unwrap();
+                let receiver = self.receiver.lock();
                 receiver.recv()
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        *self.is_complete.lock().unwrap() = true;
+        *self.is_complete.lock() = true;
 
         // Cache the result
-        let mut cache = self.result_cache.lock().unwrap();
+        let mut cache = self.result_cache.lock();
         match result {
             Ok(ref val) => {
                 *cache = Some(Ok(val.clone_ref(py)));
@@ -870,17 +776,17 @@ impl AsyncHandle {
 
     /// Wait for completion with timeout (in seconds)
     fn wait(&self, timeout_secs: Option<f64>) -> PyResult<bool> {
-        if *self.is_complete.lock().unwrap() {
+        if *self.is_complete.lock() {
             return Ok(true);
         }
 
         if let Some(secs) = timeout_secs {
             thread::sleep(Duration::from_secs_f64(secs));
-            Ok(*self.is_complete.lock().unwrap())
+            Ok(*self.is_complete.lock())
         } else {
             // Wait indefinitely by trying to receive
-            let _ = self.receiver.lock().unwrap().recv();
-            *self.is_complete.lock().unwrap() = true;
+            let _ = self.receiver.lock().recv();
+            *self.is_complete.lock() = true;
             Ok(true)
         }
     }
@@ -891,7 +797,7 @@ impl AsyncHandle {
         self.cancel_token.store(true, Ordering::SeqCst);
 
         // Mark as complete to prevent further waits
-        *self.is_complete.lock().unwrap() = true;
+        *self.is_complete.lock() = true;
 
         // Don't join the thread - that would block!
         // The thread will check the flag and exit on its own
@@ -902,7 +808,7 @@ impl AsyncHandle {
     fn cancel_with_timeout(&self, timeout_secs: f64) -> PyResult<bool> {
         self.cancel_token.store(true, Ordering::SeqCst);
 
-        let mut handle = self.thread_handle.lock().unwrap();
+        let mut handle = self.thread_handle.lock();
         if let Some(h) = handle.take() {
             let start = Instant::now();
             let timeout = Duration::from_secs_f64(timeout_secs);
@@ -943,19 +849,19 @@ impl AsyncHandle {
 
     /// Set metadata
     fn set_metadata(&self, key: String, value: String) -> PyResult<()> {
-        self.metadata.lock().unwrap().insert(key, value);
+        self.metadata.lock().insert(key, value);
         Ok(())
     }
 
     /// Get metadata
     fn get_metadata(&self, key: String) -> PyResult<Option<String>> {
-        Ok(self.metadata.lock().unwrap().get(&key).cloned())
+        Ok(self.metadata.lock().get(&key).cloned())
     }
 
     /// Get all metadata
     fn get_all_metadata(&self, py: Python) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
-        let metadata = self.metadata.lock().unwrap();
+        let metadata = self.metadata.lock();
         for (k, v) in metadata.iter() {
             dict.set_item(k, v)?;
         }
@@ -969,19 +875,19 @@ impl AsyncHandle {
 
     /// Set completion callback
     fn on_complete(&self, callback: Py<PyAny>) -> PyResult<()> {
-        *self.on_complete.lock().unwrap() = Some(callback);
+        *self.on_complete.lock() = Some(callback);
         Ok(())
     }
 
     /// Set error callback
     fn on_error(&self, callback: Py<PyAny>) -> PyResult<()> {
-        *self.on_error.lock().unwrap() = Some(callback);
+        *self.on_error.lock() = Some(callback);
         Ok(())
     }
 
     /// Set progress callback
     fn on_progress(&self, callback: Py<PyAny>) -> PyResult<()> {
-        *self.on_progress.lock().unwrap() = Some(callback);
+        *self.on_progress.lock() = Some(callback);
         Ok(())
     }
 
@@ -1097,7 +1003,7 @@ impl ParallelWrapper {
                         let _ = sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                             task_error.__str__()
                         )));
-                        *is_complete_clone.lock().unwrap() = true;
+                        *is_complete_clone.lock() = true;
                         unregister_task(&task_id_clone);
                         return;
                     }
@@ -1137,7 +1043,7 @@ impl ParallelWrapper {
 
                     // Send result through channel
                     let _ = sender.send(to_send);
-                    *is_complete_clone.lock().unwrap() = true;
+                    *is_complete_clone.lock() = true;
 
                     // Unregister task
                     unregister_task(&task_id_clone);
@@ -1207,11 +1113,11 @@ struct AsyncHandleFast {
 #[pymethods]
 impl AsyncHandleFast {
     fn is_ready(&self) -> PyResult<bool> {
-        Ok(*self.is_complete.lock().unwrap())
+        Ok(*self.is_complete.lock())
     }
 
     fn try_get(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        let mut cache = self.result_cache.lock().unwrap();
+        let mut cache = self.result_cache.lock();
         if let Some(ref cached) = *cache {
             return match cached {
                 Ok(val) => Ok(Some(val.clone_ref(py))),
@@ -1222,10 +1128,10 @@ impl AsyncHandleFast {
             };
         }
 
-        let receiver = self.receiver.lock().unwrap();
+        let receiver = self.receiver.lock();
         match receiver.try_recv() {
             Ok(result) => {
-                *self.is_complete.lock().unwrap() = true;
+                *self.is_complete.lock() = true;
                 match result {
                     Ok(val) => {
                         *cache = Some(Ok(val.clone_ref(py)));
@@ -1244,7 +1150,7 @@ impl AsyncHandleFast {
     }
 
     fn get(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let cache = self.result_cache.lock().unwrap();
+        let cache = self.result_cache.lock();
         if let Some(ref cached) = *cache {
             return match cached {
                 Ok(val) => Ok(val.clone_ref(py)),
@@ -1259,14 +1165,14 @@ impl AsyncHandleFast {
         // Release GIL before blocking
         let result = py
             .detach(|| {
-                let receiver = self.receiver.lock().unwrap();
+                let receiver = self.receiver.lock();
                 receiver.recv()
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        *self.is_complete.lock().unwrap() = true;
+        *self.is_complete.lock() = true;
 
-        let mut cache = self.result_cache.lock().unwrap();
+        let mut cache = self.result_cache.lock();
         match result {
             Ok(ref val) => {
                 *cache = Some(Ok(val.clone_ref(py)));
@@ -1325,7 +1231,7 @@ impl ParallelFastWrapper {
                     };
 
                     let _ = sender.send(to_send);
-                    *is_complete_clone.lock().unwrap() = true;
+                    *is_complete_clone.lock() = true;
                 });
             })
         });
@@ -1383,7 +1289,7 @@ impl ParallelPoolWrapper {
                     };
 
                     let _ = sender.send(to_send);
-                    *is_complete_clone.lock().unwrap() = true;
+                    *is_complete_clone.lock() = true;
                 });
             });
         });
@@ -1554,7 +1460,7 @@ impl PriorityParallelWrapper {
         };
 
         // Push to priority queue
-        PRIORITY_QUEUE.lock().unwrap().push(task);
+        PRIORITY_QUEUE.lock().push(task);
 
         // Ensure worker is running
         if !PRIORITY_WORKER_RUNNING.load(Ordering::SeqCst) {
@@ -1573,14 +1479,14 @@ impl PriorityParallelWrapper {
                     match receiver.recv() {
                         Ok(result) => {
                             let _ = std_sender.send(result);
-                            *is_complete_clone.lock().unwrap() = true;
+                            *is_complete_clone.lock() = true;
                             unregister_task(&task_id_clone);
                         }
                         Err(_) => {
                             let _ = std_sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                                 "Priority task channel closed unexpectedly"
                             )));
-                            *is_complete_clone.lock().unwrap() = true;
+                            *is_complete_clone.lock() = true;
                             unregister_task(&task_id_clone);
                         }
                     }
@@ -1712,7 +1618,7 @@ impl ParallelContext {
         };
 
         let async_handle: Py<AsyncHandle> = handle.extract()?;
-        self.handles.lock().unwrap().push(async_handle.clone_ref(py));
+        self.handles.lock().push(async_handle.clone_ref(py));
         Ok(async_handle)
     }
 
@@ -1728,7 +1634,7 @@ impl ParallelContext {
         _exc_tb: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
         // Wait for all tasks
-        let handles_guard = self.handles.lock().unwrap();
+        let handles_guard = self.handles.lock();
         for handle in handles_guard.iter() {
             let _ = handle.bind(py).call_method0("get");
         }
@@ -1794,12 +1700,117 @@ fn retry_backoff(
     Ok(decorator.into())
 }
 
+/// Retry with result caching - combines retry logic with memoization
+/// Successful results are cached, failed attempts trigger retries
+#[pyfunction]
+#[pyo3(signature = (*, max_attempts=3, cache_failures=false))]
+fn retry_cached(_py: Python<'_>, max_attempts: usize, cache_failures: bool) -> PyResult<Py<PyAny>> {
+    let factory = move |py: Python<'_>, func: Py<PyAny>| -> PyResult<Py<PyAny>> {
+        // Use DashMap for thread-safe caching
+        let cache: Arc<DashMap<String, PyResult<Py<PyAny>>>> = Arc::new(DashMap::new());
+
+        let wrapper = move |args: &Bound<'_, PyTuple>,
+                            kwargs: Option<&Bound<'_, PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let py = args.py();
+
+            // Create cache key
+            let mut key_parts: Vec<String> = vec![];
+            for arg in args.iter() {
+                key_parts.push(arg.repr()?.to_str()?.to_string());
+            }
+            if let Some(kwargs_dict) = kwargs {
+                for (key, val) in kwargs_dict.iter() {
+                    key_parts.push(format!("{}={}", key, val.repr()?.to_str()?));
+                }
+            }
+            let key = key_parts.join(",");
+
+            // Check cache
+            if let Some(cached) = cache.get(&key) {
+                return match cached.value() {
+                    Ok(val) => {
+                        println!("✓ Cache hit (success): {}", key);
+                        Ok(val.clone_ref(py))
+                    }
+                    Err(e) => {
+                        if cache_failures {
+                            println!("✗ Cache hit (failure): {}", key);
+                            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                e.to_string()
+                            ))
+                        } else {
+                            // Don't use cached failures, retry
+                            drop(cached);
+                            cache.remove(&key);
+                            // Continue to retry logic below
+                            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                "Retrying after cached failure"
+                            ))?
+                        }
+                    }
+                };
+            }
+
+            // Retry logic with caching
+            let mut last_err = None;
+            for attempt in 0..max_attempts {
+                match func.bind(py).call(args, kwargs) {
+                    Ok(res) => {
+                        let result = res.unbind();
+                        // Cache success
+                        cache.insert(key.clone(), Ok(result.clone_ref(py)));
+                        println!("✓ Cached successful result: {}", key);
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        println!("✗ Attempt {}/{} failed: {}", attempt + 1, max_attempts, e);
+                        last_err = Some(e);
+
+                        if attempt < max_attempts - 1 {
+                            thread::sleep(Duration::from_millis(100 * (attempt + 1) as u64));
+                        }
+                    }
+                }
+            }
+
+            let final_err = last_err.unwrap();
+
+            // Cache failure if requested
+            if cache_failures {
+                cache.insert(
+                    key.clone(),
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        final_err.to_string()
+                    ))
+                );
+                println!("✗ Cached failed result: {}", key);
+            }
+
+            Err(final_err)
+        };
+
+        let wrapped = PyCFunction::new_closure(py, None, None, wrapper)?;
+        Ok(wrapped.into())
+    };
+
+    let decorator = PyCFunction::new_closure(
+        _py,
+        None,
+        None,
+        move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+            let func = args.get_item(0)?.unbind();
+            factory(args.py(), func)
+        },
+    )?;
+    Ok(decorator.into())
+}
+
 /// This module is implemented in Rust.
 #[pymodule]
 fn makeparallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Original decorators
     m.add_function(wrap_pyfunction!(timer, m)?)?;
-    m.add_function(wrap_pyfunction!(log_calls, m)?)?;
     m.add_class::<CallCounter>()?;
     m.add_function(wrap_pyfunction!(retry, m)?)?;
     m.add_function(wrap_pyfunction!(memoize, m)?)?;
@@ -1846,6 +1857,7 @@ fn makeparallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_class::<ParallelContext>()?;
     m.add_function(wrap_pyfunction!(retry_backoff, m)?)?;
+    m.add_function(wrap_pyfunction!(retry_cached, m)?)?;
 
     Ok(())
 }

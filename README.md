@@ -3,7 +3,7 @@
 **The easiest way to speed up your Python code using all your CPU cores.**
 
 [![PyPI version](https://badge.fury.io/py/makeparallel.svg)](https://badge.fury.io/py/makeparallel)
-[![Tests](https://img.shields.io/badge/tests-40/40_passing-brightgreen)](tests/test_all.py)
+[![Tests](https://img.shields.io/badge/tests-37/37_passing-brightgreen)](tests/test_all.py)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -341,17 +341,6 @@ def my_function():
     pass
 
 my_function()  # Prints execution time
-```
-
-#### `@log_calls` - Log function calls and returns
-```python
-from makeparallel import log_calls
-
-@log_calls
-def my_function(x, y):
-    return x + y
-
-my_function(5, 3)  # Prints call args and return value
 ```
 
 #### `@CallCounter` - Count function invocations

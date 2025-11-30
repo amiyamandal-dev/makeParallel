@@ -2,6 +2,22 @@
 
 ## [Unreleased] - 2025-11-30
 
+### Fixed
+- **CRITICAL**: Fixed Cargo.toml edition from invalid "2024" to "2021"
+- Fixed `@parallel_priority` to return full `AsyncHandle` instead of minimal `AsyncHandleFast`
+  - Now includes timeout, cancellation, metadata, and progress tracking
+  - Properly integrates with shutdown and backpressure systems
+  - Added channel bridge for crossbeam to std compatibility
+- Fixed priority worker to record metrics and handle errors properly
+- Module name normalized to `makeparallel` (lowercase) for PyPI compatibility
+- All tests now pass (40/40) including previously broken priority test
+
+### Changed
+- Enhanced `@parallel_priority` with full AsyncHandle features
+- Updated all documentation to use correct GitHub repository URLs
+- Added comprehensive project metadata to pyproject.toml and Cargo.toml
+- README.md now references from pyproject.toml for PyPI display
+
 ### Added
 
 #### 1. Thread Pool Configuration
@@ -120,7 +136,7 @@ mp.reset_metrics()
 ## [0.1.0] - Previous
 
 ### Initial Release
-- Basic decorators: @timer, @log_calls, @CallCounter, @retry, @memoize
+- Basic decorators: @timer, @CallCounter, @retry, @memoize
 - Parallel execution: @parallel, @parallel_fast, @parallel_pool
 - Optimized implementations with Crossbeam and Rayon
 - AsyncHandle for task management

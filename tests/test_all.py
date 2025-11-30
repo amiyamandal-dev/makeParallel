@@ -94,29 +94,6 @@ def test_timer_args(t):
 
 
 # =============================================================================
-# TEST 2: Log Calls Decorator
-# =============================================================================
-@runner.test("Log Calls - Basic functionality")
-def test_log_calls_basic(t):
-    @mp.log_calls
-    def multiply(x, y):
-        return x * y
-
-    result = multiply(3, 4)
-    t.assert_equal(result, 12)
-
-
-@runner.test("Log Calls - With kwargs")
-def test_log_calls_kwargs(t):
-    @mp.log_calls
-    def greet(name, greeting="Hello"):
-        return f"{greeting}, {name}!"
-
-    result = greet("World", greeting="Hi")
-    t.assert_equal(result, "Hi, World!")
-
-
-# =============================================================================
 # TEST 3: CallCounter Decorator
 # =============================================================================
 @runner.test("CallCounter - Count tracking")
@@ -480,17 +457,6 @@ def test_parallel_class_method(t):
 # =============================================================================
 # TEST 12: Combined Decorators
 # =============================================================================
-@runner.test("Combined - Timer + Log")
-def test_combined_timer_log(t):
-    @mp.timer
-    @mp.log_calls
-    def combined(x):
-        return x + 1
-
-    result = combined(5)
-    t.assert_equal(result, 6)
-
-
 @runner.test("Combined - Memoize + Timer")
 def test_combined_memoize_timer(t):
     @mp.memoize
