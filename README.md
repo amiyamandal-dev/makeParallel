@@ -3,7 +3,7 @@
 **The easiest way to speed up your Python code using all your CPU cores.**
 
 [![PyPI version](https://badge.fury.io/py/makeparallel.svg)](https://badge.fury.io/py/makeparallel)
-[![Tests](https://img.shields.io/badge/tests-37/37_passing-brightgreen)](tests/test_all.py)
+[![Tests](https://img.shields.io/badge/tests-45/45_passing-brightgreen)](tests/test_all.py)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -21,6 +21,7 @@ It's powered by **Rust** to safely bypass Python's Global Interpreter Lock (GIL)
 - [When Should I Use This?](#-when-should-i-use-this)
 - [Complete Feature Guide](#-complete-feature-guide)
   - [Parallel Execution Decorators](#-parallel-execution-decorators)
+  - [Callbacks and Event Handling](#-callbacks-and-event-handling)
   - [Batch Processing](#️-batch-processing)
   - [Caching Decorators](#-caching-decorators)
   - [Retry Logic](#-retry-logic)
@@ -48,7 +49,11 @@ Python has a rule called the Global Interpreter Lock (GIL) that only lets **one 
 - **So Simple:** Just add the `@parallel` decorator to any function. That's it!
 - **True Speed-Up:** Uses Rust threads to run your code on all available CPU cores.
 - **Doesn't Block:** Your main application stays responsive while the work happens in the background.
+- **Smart Callbacks:** Monitor progress, handle completion, catch errors - all with simple callbacks.
+- **Task Dependencies:** Build complex pipelines where tasks automatically wait for their dependencies.
+- **Auto Progress Tracking:** Report progress from within tasks without managing task IDs.
 - **No `multiprocessing` Headaches:** Avoids the complexity, memory overhead, and data-sharing issues of `multiprocessing`.
+- **Production Ready:** Built-in error handling, timeouts, cancellation, and graceful shutdown.
 - **Works with Your Code:** Decorate any function, even class methods.
 
 ## 📦 Installation
@@ -132,20 +137,29 @@ For **I/O-bound** tasks (like waiting for a web request or reading a file), Pyth
 
 ### 🔥 Parallel Execution Decorators
 
-#### `@parallel` - Full-featured parallel execution with advanced control
+#### `@parallel` - Full-featured parallel execution with callbacks and advanced control
 ```python
-from makeparallel import parallel
+from makeparallel import parallel, report_progress
 
 @parallel
 def cpu_intensive_task(n):
+    for i in range(0, n, n//10):
+        # Report progress automatically (no task_id needed!)
+        report_progress(i / n)
+        # Do work...
     return sum(i * i for i in range(n))
 
 # Returns immediately with an AsyncHandle
 handle = cpu_intensive_task(20_000_000, timeout=5.0)
 
+# Set up callbacks (execute automatically when task completes)
+handle.on_progress(lambda p: print(f"Progress: {p*100:.0f}%"))
+handle.on_complete(lambda result: print(f"Success! Result: {result}"))
+handle.on_error(lambda error: print(f"Error occurred: {error}"))
+
 # Check status
 if handle.is_ready():
-    result = handle.get()
+    result = handle.get()  # Callbacks fire here
 
 # Try to get result without blocking
 result = handle.try_get()  # Returns None if not ready
@@ -212,6 +226,72 @@ high_result = high.get()
 # Stop the worker when done
 stop_priority_worker()
 ```
+
+#### `@parallel_with_deps` - Task dependencies and pipelines
+```python
+from makeparallel import parallel_with_deps
+
+@parallel_with_deps
+def step1():
+    return "data from step 1"
+
+@parallel_with_deps
+def step2(deps):
+    # deps is a tuple of all dependency results
+    data = deps[0]  # Result from step1
+    return f"processed {data}"
+
+@parallel_with_deps
+def step3(deps):
+    result = deps[0]  # Result from step2
+    return f"final: {result}"
+
+# Build dependency chain
+h1 = step1()
+h2 = step2(depends_on=[h1])  # Automatically waits for h1
+h3 = step3(depends_on=[h2])  # Automatically waits for h2
+
+# Execute entire pipeline
+final = h3.get()  # Returns: "final: processed data from step 1"
+```
+
+### 🎯 Callbacks and Event Handling
+
+makeParallel provides a powerful callback system for monitoring task execution:
+
+```python
+from makeparallel import parallel, report_progress
+
+@parallel
+def download_file(url):
+    # Simulate download with progress
+    for i in range(100):
+        download_chunk(url, i)
+        # Report progress (task_id is automatic!)
+        report_progress(i / 100.0)
+    return f"Downloaded {url}"
+
+handle = download_file("https://example.com/large_file.zip")
+
+# Set up callbacks
+handle.on_progress(lambda p: print(f"Downloaded: {p*100:.1f}%"))
+handle.on_complete(lambda result: notify_user(result))
+handle.on_error(lambda error: log_error(error))
+
+# Callbacks fire automatically when you get the result
+result = handle.get()
+```
+
+**Callback Types:**
+- `on_progress(callback)` - Called when `report_progress()` is called inside task
+- `on_complete(callback)` - Called when task succeeds (receives result)
+- `on_error(callback)` - Called when task fails (receives error string)
+
+**Key Features:**
+- ✅ Automatic task_id tracking (no need to pass task_id!)
+- ✅ Thread-safe callback execution
+- ✅ Error isolation (callback failures don't crash tasks)
+- ✅ Progress validation (NaN/Infinity rejected)
 
 ### 🗺️ Batch Processing
 
@@ -382,21 +462,56 @@ set_max_concurrent_tasks(100)
 configure_memory_limit(max_memory_percent=80.0)
 ```
 
-#### Progress Reporting
+#### Progress Reporting and Callbacks
 ```python
 from makeparallel import parallel, report_progress
 
 @parallel
 def long_task():
     for i in range(100):
-        # Report progress from within task
-        report_progress(task_id, i / 100.0)
+        # Report progress from within task (task_id is automatic!)
+        report_progress(i / 100.0)
         # Do work...
     return "done"
 
 handle = long_task()
-# Check progress from outside
-print(f"Progress: {handle.get_progress() * 100}%")
+
+# Set up callbacks
+handle.on_progress(lambda p: print(f"Progress: {p*100:.1f}%"))
+handle.on_complete(lambda result: print(f"Finished: {result}"))
+handle.on_error(lambda error: print(f"Error: {error}"))
+
+# Get result (callbacks fire automatically)
+result = handle.get()
+```
+
+#### Task Dependencies
+```python
+from makeparallel import parallel_with_deps
+
+@parallel_with_deps
+def fetch_data():
+    return {"users": 100, "orders": 500}
+
+@parallel_with_deps
+def process_data(deps):
+    # deps[0] contains result from fetch_data
+    data = deps[0]
+    return f"Processed {data['users']} users"
+
+@parallel_with_deps
+def save_results(deps):
+    # deps[0] contains result from process_data
+    processed = deps[0]
+    return f"Saved: {processed}"
+
+# Build a dependency pipeline
+h1 = fetch_data()
+h2 = process_data(depends_on=[h1])  # Waits for h1
+h3 = save_results(depends_on=[h2])  # Waits for h2
+
+# Execute the entire pipeline
+final_result = h3.get()  # Returns: "Saved: Processed 100 users"
 ```
 
 #### Graceful Shutdown
@@ -534,20 +649,20 @@ handles = [fetch_url(url) for url in urls]
 results = [h.get() for h in handles]
 ```
 
-### Example 3: Data Analysis with Progress Tracking
+### Example 3: Data Analysis with Progress Tracking and Callbacks
 ```python
 from makeparallel import parallel, report_progress
 import pandas as pd
 
 @parallel
-def analyze_dataset(file_path, task_id):
+def analyze_dataset(file_path):
     df = pd.read_csv(file_path)
     total_rows = len(df)
 
     results = []
     for i, row in df.iterrows():
-        # Report progress
-        report_progress(task_id, i / total_rows)
+        # Report progress (task_id is automatic!)
+        report_progress(i / total_rows)
 
         # Perform analysis
         result = complex_analysis(row)
@@ -557,16 +672,58 @@ def analyze_dataset(file_path, task_id):
 
 handle = analyze_dataset("large_dataset.csv")
 
-# Monitor progress
-import time
-while not handle.is_ready():
-    print(f"Progress: {handle.get_progress() * 100:.1f}%")
-    time.sleep(1)
+# Set up callbacks for monitoring
+handle.on_progress(lambda p: print(f"Analyzed: {p*100:.1f}%"))
+handle.on_complete(lambda results: print(f"Analysis complete! {len(results)} rows"))
+handle.on_error(lambda e: print(f"Analysis failed: {e}"))
 
+# Get results (callbacks fire automatically)
 final_results = handle.get()
 ```
 
-### Example 4: Machine Learning Model Training
+### Example 4: ETL Pipeline with Task Dependencies
+```python
+from makeparallel import parallel_with_deps
+
+@parallel_with_deps
+def extract_data(source):
+    # Fetch data from database/API
+    print(f"Extracting from {source}...")
+    return fetch_raw_data(source)
+
+@parallel_with_deps
+def transform_data(deps):
+    # deps[0] contains result from extract_data
+    raw_data = deps[0]
+    print("Transforming data...")
+    return clean_and_transform(raw_data)
+
+@parallel_with_deps
+def validate_data(deps):
+    # deps[0] contains result from transform_data
+    transformed = deps[0]
+    print("Validating data...")
+    return run_validation_checks(transformed)
+
+@parallel_with_deps
+def load_data(deps):
+    # deps[0] contains result from validate_data
+    validated = deps[0]
+    print("Loading to warehouse...")
+    return insert_into_warehouse(validated)
+
+# Build ETL pipeline with dependencies
+h1 = extract_data("production_db")
+h2 = transform_data(depends_on=[h1])   # Waits for extract
+h3 = validate_data(depends_on=[h2])    # Waits for transform
+h4 = load_data(depends_on=[h3])        # Waits for validate
+
+# Execute entire pipeline
+result = h4.get()  # Blocks until all dependencies complete
+print(f"Pipeline complete: {result}")
+```
+
+### Example 5: Machine Learning Model Training
 ```python
 from makeparallel import parallel, gather, configure_thread_pool
 from sklearn.model_selection import train_test_split
@@ -620,6 +777,18 @@ print(f"Best params: {best['params']}, Score: {best['score']}")
 - Always check `handle.get()` in a try/except block
 - Use `gather()` with `on_error="raise"` to see all errors
 - Enable profiling to see failed task counts: `@profiled`
+- Use `on_error` callbacks to capture errors: `handle.on_error(lambda e: print(e))`
+
+### Callbacks not firing
+- Make sure you call `handle.get()` or `handle.wait()` to trigger callbacks
+- Callbacks execute during result retrieval
+- Check callback syntax: `handle.on_progress(lambda p: print(p))`
+
+### Dependencies hanging
+- Check for circular dependencies (task A depends on B, B depends on A)
+- Verify all dependencies complete successfully
+- Use timeouts: `task(depends_on=[h1], timeout=60.0)`
+- Enable logging to see dependency errors: `RUST_LOG=makeparallel=debug`
 
 ## 🤝 Contributing
 
@@ -651,10 +820,16 @@ python tests/test_all.py
 python tests/test_all.py
 
 # The test suite includes:
-# - 39 passing tests covering all features
+# - 37 core tests covering all decorators and features
+# - 3 callback tests (on_progress, on_complete, on_error)
+# - 5 progress tracking tests
 # - Performance benchmarks
 # - Edge case validation
 # - Error handling verification
+
+# Run specific test suites
+python test_simple_callbacks.py      # Callback functionality
+python test_progress_fix.py          # Progress tracking
 ```
 
 ### Code Quality

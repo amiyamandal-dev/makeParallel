@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::cmp::Ordering as CmpOrdering;
+use std::cell::RefCell;
 
 // Optimized imports
 use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender, unbounded};
@@ -17,11 +18,42 @@ use rayon::prelude::*;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;  // Faster mutex implementation
 
+// Logging
+use log::{debug, warn, error};
+
+// System monitoring
+use sysinfo::System;
+
 // Module imports
 mod types;
 use types::TaskError as CustomTaskError;
 
 type TaskError = CustomTaskError;
+
+// Callback types
+type CallbackFunc = Arc<Mutex<Option<Py<PyAny>>>>;
+
+// Task dependency tracking
+static TASK_DEPENDENCIES: Lazy<Arc<DashMap<String, Vec<String>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+static TASK_RESULTS: Lazy<Arc<DashMap<String, Py<PyAny>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Store task errors for dependency failure propagation
+static TASK_ERRORS: Lazy<Arc<DashMap<String, String>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Track dependency reference counts for cleanup
+static DEPENDENCY_COUNTS: Lazy<Arc<DashMap<String, usize>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Timeout cancellation handles
+static TIMEOUT_HANDLES: Lazy<Arc<Mutex<Vec<(String, Sender<()>)>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+// System monitor for memory checking
+static SYSTEM_MONITOR: Lazy<Mutex<System>> = Lazy::new(|| Mutex::new(System::new_all()));
 
 /// Global shutdown flag
 static SHUTDOWN_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
@@ -34,7 +66,7 @@ static TASK_ID_COUNTER: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::
 
 /// Check if shutdown is requested
 fn is_shutdown_requested() -> bool {
-    SHUTDOWN_FLAG.load(Ordering::SeqCst)
+    SHUTDOWN_FLAG.load(Ordering::Acquire)
 }
 
 /// Register a task as active
@@ -58,7 +90,7 @@ fn get_active_task_count() -> usize {
 #[pyfunction]
 fn shutdown(timeout_secs: Option<f64>, cancel_pending: bool) -> PyResult<bool> {
     println!("Initiating graceful shutdown...");
-    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+    SHUTDOWN_FLAG.store(true, Ordering::Release);
 
     let start = Instant::now();
     let timeout = timeout_secs.map(Duration::from_secs_f64).unwrap_or(Duration::from_secs(30));
@@ -90,7 +122,7 @@ fn shutdown(timeout_secs: Option<f64>, cancel_pending: bool) -> PyResult<bool> {
 /// Reset shutdown flag (for testing)
 #[pyfunction]
 fn reset_shutdown() -> PyResult<()> {
-    SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+    SHUTDOWN_FLAG.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -108,8 +140,27 @@ fn set_max_concurrent_tasks(max_tasks: usize) -> PyResult<()> {
 /// Wait for available slot (backpressure)
 fn wait_for_slot() {
     if let Some(max) = *MAX_CONCURRENT_TASKS.lock() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(300); // 5 minute timeout
+        let mut backoff = Duration::from_millis(10);
+
         while get_active_task_count() >= max {
-            thread::sleep(Duration::from_millis(10));
+            // CRITICAL FIX: Check shutdown
+            if is_shutdown_requested() {
+                warn!("wait_for_slot cancelled: shutdown in progress");
+                return;
+            }
+
+            // CRITICAL FIX: Add timeout
+            if start.elapsed() > timeout {
+                error!("wait_for_slot timed out after 5 minutes");
+                return;
+            }
+
+            thread::sleep(backoff);
+
+            // CRITICAL FIX: Exponential backoff
+            backoff = (backoff * 2).min(Duration::from_secs(1));
         }
     }
 }
@@ -136,10 +187,25 @@ fn configure_memory_limit(max_memory_percent: f64) -> PyResult<()> {
 
 /// Check if memory usage is acceptable
 fn check_memory_ok() -> bool {
-    if let Some(_limit) = *MEMORY_LIMIT_PERCENT.lock() {
-        // In a real implementation, would check actual memory usage
-        // For now, always return true
-        // TODO: Add actual memory checking with sysinfo crate
+    if let Some(limit_percent) = *MEMORY_LIMIT_PERCENT.lock() {
+        // CRITICAL FIX: Implement actual memory monitoring
+        let mut sys = SYSTEM_MONITOR.lock();
+        sys.refresh_memory();
+
+        let total = sys.total_memory();
+        let used = sys.used_memory();
+        let usage_percent = (used as f64 / total as f64) * 100.0;
+
+        if usage_percent > limit_percent {
+            warn!(
+                "Memory limit exceeded: {:.1}% used (limit: {:.1}%)",
+                usage_percent,
+                limit_percent
+            );
+            return false;
+        }
+
+        debug!("Memory usage: {:.1}%", usage_percent);
         true
     } else {
         true
@@ -154,16 +220,90 @@ fn check_memory_ok() -> bool {
 static TASK_PROGRESS_MAP: Lazy<Arc<DashMap<String, f64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Report progress from within a task
+// Thread-local storage for current task ID
+thread_local! {
+    static CURRENT_TASK_ID: RefCell<Option<String>> = RefCell::new(None);
+}
+
+/// Set the current task ID for this thread (internal use)
+fn set_current_task_id(task_id: Option<String>) {
+    CURRENT_TASK_ID.with(|id| {
+        *id.borrow_mut() = task_id;
+    });
+}
+
+/// Get the current task ID for this thread
 #[pyfunction]
-fn report_progress(task_id: String, progress: f64) -> PyResult<()> {
+fn get_current_task_id() -> PyResult<Option<String>> {
+    Ok(CURRENT_TASK_ID.with(|id| id.borrow().clone()))
+}
+
+/// Report progress from within a task (with explicit task_id)
+#[pyfunction]
+#[pyo3(signature = (progress, task_id=None))]
+fn report_progress(progress: f64, task_id: Option<String>) -> PyResult<()> {
+    // CRITICAL FIX: Add NaN/Inf check
+    if !progress.is_finite() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "progress must be a finite number (not NaN or Infinity)"
+        ));
+    }
+
     if progress < 0.0 || progress > 1.0 {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "progress must be between 0.0 and 1.0"
         ));
     }
-    TASK_PROGRESS_MAP.insert(task_id, progress);
+
+    // Use provided task_id or get from thread-local storage
+    let actual_task_id = if let Some(tid) = task_id {
+        tid
+    } else {
+        CURRENT_TASK_ID.with(|id| {
+            id.borrow().clone().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "No task_id found. report_progress must be called from within a @parallel decorated function, or you must provide task_id explicitly."
+                )
+            })
+        })?
+    };
+
+    TASK_PROGRESS_MAP.insert(actual_task_id.clone(), progress);
+
+    // CRITICAL FIX: Non-blocking callback with error handling
+    if let Some(callback) = TASK_PROGRESS_CALLBACKS.get(&actual_task_id) {
+        Python::attach(|py| {
+            // Execute callback with error handling
+            match callback.bind(py).call1((progress,)) {
+                Ok(_) => {},
+                Err(e) => {
+                    warn!("Progress callback failed for task {}: {}", actual_task_id, e);
+                }
+            }
+        });
+    }
+
     Ok(())
+}
+
+/// Global map for progress callbacks
+static TASK_PROGRESS_CALLBACKS: Lazy<Arc<DashMap<String, Py<PyAny>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Register progress callback for a task (internal)
+fn register_progress_callback(task_id: String, callback: Py<PyAny>) {
+    TASK_PROGRESS_CALLBACKS.insert(task_id, callback);
+}
+
+/// Unregister progress callback (internal)
+fn unregister_progress_callback(task_id: &str) {
+    TASK_PROGRESS_CALLBACKS.remove(task_id);
+}
+
+/// Clear progress for a completed task (internal cleanup)
+fn clear_task_progress(task_id: &str) {
+    TASK_PROGRESS_MAP.remove(task_id);
+    unregister_progress_callback(task_id);
 }
 
 // =============================================================================
@@ -260,15 +400,15 @@ static PRIORITY_WORKER_RUNNING: Lazy<Arc<AtomicBool>> =
 /// Start the priority queue worker
 #[pyfunction]
 fn start_priority_worker(py: Python) -> PyResult<()> {
-    if PRIORITY_WORKER_RUNNING.load(Ordering::SeqCst) {
+    if PRIORITY_WORKER_RUNNING.load(Ordering::Acquire) {
         return Ok(());
     }
 
-    PRIORITY_WORKER_RUNNING.store(true, Ordering::SeqCst);
+    PRIORITY_WORKER_RUNNING.store(true, Ordering::Release);
 
     py.detach(|| {
         thread::spawn(move || {
-            while PRIORITY_WORKER_RUNNING.load(Ordering::SeqCst) {
+            while PRIORITY_WORKER_RUNNING.load(Ordering::Acquire) {
                 let task_opt = {
                     let mut queue = PRIORITY_QUEUE.lock();
                     queue.pop()
@@ -303,7 +443,10 @@ fn start_priority_worker(py: Python) -> PyResult<()> {
                             }
                         };
 
-                        let _ = task.sender.send(to_send);
+                        // CRITICAL FIX: Handle channel send errors
+                        if let Err(e) = task.sender.send(to_send) {
+                            error!("Failed to send priority task result: {}", e);
+                        }
                     });
                 } else {
                     thread::sleep(Duration::from_millis(10));
@@ -318,7 +461,7 @@ fn start_priority_worker(py: Python) -> PyResult<()> {
 /// Stop the priority queue worker
 #[pyfunction]
 fn stop_priority_worker() -> PyResult<()> {
-    PRIORITY_WORKER_RUNNING.store(false, Ordering::SeqCst);
+    PRIORITY_WORKER_RUNNING.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -352,12 +495,12 @@ static FAILED_COUNTER: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::n
 
 /// Record task execution
 fn record_task_execution(name: &str, duration_ms: f64, success: bool) {
-    TASK_COUNTER.fetch_add(1, Ordering::SeqCst);
+    TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     if success {
-        COMPLETED_COUNTER.fetch_add(1, Ordering::SeqCst);
+        COMPLETED_COUNTER.fetch_add(1, Ordering::Relaxed);
     } else {
-        FAILED_COUNTER.fetch_add(1, Ordering::SeqCst);
+        FAILED_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
 
     let mut metrics = METRICS.lock();
@@ -757,11 +900,23 @@ impl AsyncHandle {
 
         *self.is_complete.lock() = true;
 
-        // Cache the result
+        // Cache the result and trigger callbacks
         let mut cache = self.result_cache.lock();
         match result {
             Ok(ref val) => {
                 *cache = Some(Ok(val.clone_ref(py)));
+
+                // CRITICAL FIX: Proper callback error handling
+                if let Some(ref callback) = *self.on_complete.lock() {
+                    match callback.bind(py).call1((val.bind(py),)) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            error!("on_complete callback failed: {}", e);
+                            // Don't propagate callback errors to task result
+                        }
+                    }
+                }
+
                 Ok(val.clone_ref(py))
             }
             Err(e) => {
@@ -769,6 +924,17 @@ impl AsyncHandle {
                 *cache = Some(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     err_str.clone(),
                 )));
+
+                // CRITICAL FIX: Proper error callback handling
+                if let Some(ref callback) = *self.on_error.lock() {
+                    match callback.bind(py).call1((err_str.clone(),)) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            error!("on_error callback failed: {}", e);
+                        }
+                    }
+                }
+
                 Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err_str))
             }
         }
@@ -793,8 +959,8 @@ impl AsyncHandle {
 
     /// Cancel the operation (non-blocking - just sets the flag)
     fn cancel(&self) -> PyResult<()> {
-        // Set cancellation flag
-        self.cancel_token.store(true, Ordering::SeqCst);
+        // Set cancellation flag with Release ordering
+        self.cancel_token.store(true, Ordering::Release);
 
         // Mark as complete to prevent further waits
         *self.is_complete.lock() = true;
@@ -806,7 +972,7 @@ impl AsyncHandle {
 
     /// Cancel with timeout (in seconds)
     fn cancel_with_timeout(&self, timeout_secs: f64) -> PyResult<bool> {
-        self.cancel_token.store(true, Ordering::SeqCst);
+        self.cancel_token.store(true, Ordering::Release);
 
         let mut handle = self.thread_handle.lock();
         if let Some(h) = handle.take() {
@@ -829,7 +995,7 @@ impl AsyncHandle {
 
     /// Check if task was cancelled
     fn is_cancelled(&self) -> PyResult<bool> {
-        Ok(self.cancel_token.load(Ordering::SeqCst))
+        Ok(self.cancel_token.load(Ordering::Acquire))
     }
 
     /// Get elapsed time since task start (in seconds)
@@ -886,8 +1052,9 @@ impl AsyncHandle {
     }
 
     /// Set progress callback
-    fn on_progress(&self, callback: Py<PyAny>) -> PyResult<()> {
-        *self.on_progress.lock() = Some(callback);
+    fn on_progress(&self, py: Python, callback: Py<PyAny>) -> PyResult<()> {
+        *self.on_progress.lock() = Some(callback.clone_ref(py));
+        register_progress_callback(self.task_id.clone(), callback);
         Ok(())
     }
 
@@ -937,7 +1104,7 @@ impl ParallelWrapper {
         let func = self.func.clone_ref(py);
 
         // Generate unique task ID
-        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
         let task_id_clone = task_id.clone();
 
         // Register task as active
@@ -973,7 +1140,7 @@ impl ParallelWrapper {
             let cancel_token_timeout = cancel_token.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs_f64(timeout_secs));
-                cancel_token_timeout.store(true, Ordering::SeqCst);
+                cancel_token_timeout.store(true, Ordering::Release);
             });
         }
 
@@ -984,8 +1151,11 @@ impl ParallelWrapper {
                 Python::attach(|py| {
                     let exec_start = Instant::now();
 
+                    // Set task_id in thread-local storage for progress reporting
+                    set_current_task_id(Some(task_id_clone.clone()));
+
                     // Check shutdown or cancellation before execution
-                    if is_shutdown_requested() || cancel_token_clone.load(Ordering::SeqCst) {
+                    if is_shutdown_requested() || cancel_token_clone.load(Ordering::Acquire) {
                         let reason = if is_shutdown_requested() {
                             "Task cancelled: shutdown requested"
                         } else {
@@ -1000,11 +1170,17 @@ impl ParallelWrapper {
                             task_id: task_id_clone.clone(),
                         };
 
-                        let _ = sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        // CRITICAL FIX: Handle channel send errors
+                        if let Err(e) = sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                             task_error.__str__()
-                        )));
+                        ))) {
+                            error!("Failed to send cancellation error for task {}: {}", task_id_clone, e);
+                            store_task_error(task_id_clone.clone(), format!("Cancellation failed: {}", e));
+                        }
                         *is_complete_clone.lock() = true;
                         unregister_task(&task_id_clone);
+                        clear_task_progress(&task_id_clone);
+                        set_current_task_id(None);
                         return;
                     }
 
@@ -1041,12 +1217,17 @@ impl ParallelWrapper {
                         }
                     };
 
-                    // Send result through channel
-                    let _ = sender.send(to_send);
+                    // CRITICAL FIX: Handle channel send errors
+                    if let Err(e) = sender.send(to_send) {
+                        error!("Failed to send task result for task {}: {}", task_id_clone, e);
+                        store_task_error(task_id_clone.clone(), format!("Channel send failed: {}", e));
+                    }
                     *is_complete_clone.lock() = true;
 
-                    // Unregister task
+                    // Cleanup: unregister task and clear progress
                     unregister_task(&task_id_clone);
+                    clear_task_progress(&task_id_clone);
+                    set_current_task_id(None);
                 });
             })
         });
@@ -1187,6 +1368,299 @@ impl AsyncHandleFast {
             }
         }
     }
+}
+
+// =============================================================================
+// TASK DEPENDENCY SYSTEM
+// =============================================================================
+
+/// Wait for dependencies to complete
+fn wait_for_dependencies(dependencies: &[String]) -> PyResult<Vec<Py<PyAny>>> {
+    let mut results = Vec::new();
+
+    for dep_id in dependencies {
+        // Wait for dependency result to be available
+        let mut attempts = 0;
+        let max_attempts = 6000; // 10 minutes max wait
+
+        loop {
+            // CRITICAL FIX: Check shutdown flag
+            if is_shutdown_requested() {
+                warn!("Dependency wait cancelled: shutdown in progress");
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Dependency wait cancelled: shutdown in progress"
+                ));
+            }
+
+            // CRITICAL FIX: Check for task failures via error storage
+            if let Some(error) = TASK_ERRORS.get(dep_id) {
+                error!("Dependency {} failed: {}", dep_id, error.value());
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Dependency {} failed: {}", dep_id, error.value())
+                ));
+            }
+
+            if let Some(result) = TASK_RESULTS.get(dep_id) {
+                Python::attach(|py| {
+                    results.push(result.clone_ref(py));
+                });
+                break;
+            }
+
+            if attempts >= max_attempts {
+                error!("Dependency {} timed out after 10 minutes", dep_id);
+                return Err(PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(
+                    format!("Dependency {} timed out after 10 minutes", dep_id)
+                ));
+            }
+
+            thread::sleep(Duration::from_millis(100));
+            attempts += 1;
+        }
+    }
+
+    Ok(results)
+}
+
+/// Store task result for dependencies
+fn store_task_result(task_id: String, result: Py<PyAny>) {
+    TASK_RESULTS.insert(task_id, result);
+}
+
+/// Clear task result after consumption
+fn clear_task_result(task_id: &str) {
+    TASK_RESULTS.remove(task_id);
+}
+
+/// Store task error for dependency failure propagation
+fn store_task_error(task_id: String, error: String) {
+    TASK_ERRORS.insert(task_id, error);
+}
+
+/// Clear task error
+fn clear_task_error(task_id: &str) {
+    TASK_ERRORS.remove(task_id);
+}
+
+/// Parallel wrapper with dependency support
+#[pyclass]
+struct ParallelWithDeps {
+    func: Py<PyAny>,
+}
+
+#[pymethods]
+impl ParallelWithDeps {
+    #[pyo3(signature = (*args, depends_on=None, timeout=None, **kwargs))]
+    fn __call__(
+        &self,
+        py: Python,
+        args: &Bound<'_, PyTuple>,
+        depends_on: Option<Vec<Py<AsyncHandle>>>,
+        timeout: Option<f64>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<AsyncHandle>> {
+        // Extract dependency task IDs
+        let dep_ids: Vec<String> = if let Some(deps) = depends_on {
+            deps.iter()
+                .map(|h| h.borrow(py).get_task_id())
+                .collect::<PyResult<Vec<String>>>()?
+        } else {
+            Vec::new()
+        };
+
+        // Check if shutdown is requested
+        if is_shutdown_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Cannot start new tasks: shutdown in progress"
+            ));
+        }
+
+        wait_for_slot();
+
+        if !check_memory_ok() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Memory limit reached, cannot start new task"
+            ));
+        }
+
+        let func = self.func.clone_ref(py);
+        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let task_id_clone = task_id.clone();
+
+        // Register dependencies
+        if !dep_ids.is_empty() {
+            TASK_DEPENDENCIES.insert(task_id.clone(), dep_ids.clone());
+        }
+
+        register_task(task_id.clone());
+
+        let func_name = func
+            .bind(py)
+            .getattr("__name__")
+            .ok()
+            .and_then(|n| n.extract::<String>().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let args_py: Py<PyTuple> = args.clone().unbind();
+        let kwargs_py: Option<Py<PyDict>> = kwargs.map(|k| k.clone().unbind());
+
+        let (sender, receiver): (Sender<PyResult<Py<PyAny>>>, Receiver<PyResult<Py<PyAny>>>) =
+            channel();
+
+        let is_complete = Arc::new(Mutex::new(false));
+        let is_complete_clone = is_complete.clone();
+
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_token_clone = cancel_token.clone();
+
+        let func_name_clone = func_name.clone();
+        let start_time = Instant::now();
+
+        if let Some(timeout_secs) = timeout {
+            let cancel_token_timeout = cancel_token.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs_f64(timeout_secs));
+                cancel_token_timeout.store(true, Ordering::Release);
+            });
+        }
+
+        let handle = py.detach(|| {
+            thread::spawn(move || {
+                Python::attach(|py| {
+                    let exec_start = Instant::now();
+                    set_current_task_id(Some(task_id_clone.clone()));
+
+                    // Wait for dependencies first
+                    let dep_results = if !dep_ids.is_empty() {
+                        match wait_for_dependencies(&dep_ids) {
+                            Ok(results) => results,
+                            Err(e) => {
+                                // CRITICAL FIX: Handle channel send errors
+                                if let Err(send_err) = sender.send(Err(e)) {
+                                    error!("Failed to send dependency error for task {}: {}", task_id_clone, send_err);
+                                    store_task_error(task_id_clone.clone(), format!("Dependency wait failed: {}", send_err));
+                                }
+                                *is_complete_clone.lock() = true;
+                                unregister_task(&task_id_clone);
+                                clear_task_progress(&task_id_clone);
+                                set_current_task_id(None);
+                                return;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    if is_shutdown_requested() || cancel_token_clone.load(Ordering::Acquire) {
+                        let reason = if is_shutdown_requested() {
+                            "Task cancelled: shutdown requested"
+                        } else {
+                            "Task was cancelled or timed out"
+                        };
+
+                        let task_error = TaskError {
+                            task_name: func_name_clone.clone(),
+                            elapsed_time: exec_start.elapsed().as_secs_f64(),
+                            error_message: reason.to_string(),
+                            error_type: "CancellationError".to_string(),
+                            task_id: task_id_clone.clone(),
+                        };
+
+                        // CRITICAL FIX: Handle channel send errors
+                        if let Err(e) = sender.send(Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            task_error.__str__()
+                        ))) {
+                            error!("Failed to send cancellation error for task {}: {}", task_id_clone, e);
+                            store_task_error(task_id_clone.clone(), format!("Cancellation failed: {}", e));
+                        }
+                        *is_complete_clone.lock() = true;
+                        unregister_task(&task_id_clone);
+                        clear_task_progress(&task_id_clone);
+                        set_current_task_id(None);
+                        return;
+                    }
+
+                    // If we have dependencies, pass their results as first argument
+                    let final_result = if !dep_results.is_empty() {
+                        // Create new tuple with dependency results + original args
+                        let dep_tuple = PyTuple::new(py, dep_results.iter().map(|r| r.bind(py))).unwrap();
+                        let mut combined_args = vec![dep_tuple.into_any().unbind()];
+
+                        for arg in args_py.bind(py).iter() {
+                            combined_args.push(arg.unbind());
+                        }
+
+                        let new_tuple = PyTuple::new(py, combined_args.iter().map(|a| a.bind(py))).unwrap();
+                        func.bind(py).call(new_tuple, kwargs_py.as_ref().map(|k| k.bind(py)))
+                    } else {
+                        func.bind(py).call(args_py.bind(py), kwargs_py.as_ref().map(|k| k.bind(py)))
+                    };
+
+                    let exec_time = exec_start.elapsed().as_secs_f64() * 1000.0;
+
+                    let to_send = match final_result {
+                        Ok(val) => {
+                            record_task_execution(&func_name_clone, exec_time, true);
+                            let unbound = val.unbind();
+                            store_task_result(task_id_clone.clone(), unbound.clone_ref(py));
+                            Ok(unbound)
+                        }
+                        Err(e) => {
+                            record_task_execution(&func_name_clone, exec_time, false);
+
+                            let error_type = e.get_type(py).name()
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|_| "UnknownError".to_string());
+
+                            let task_error = TaskError {
+                                task_name: func_name_clone.clone(),
+                                elapsed_time: exec_start.elapsed().as_secs_f64(),
+                                error_message: e.to_string(),
+                                error_type,
+                                task_id: task_id_clone.clone(),
+                            };
+
+                            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                task_error.__str__()
+                            ))
+                        }
+                    };
+
+                    let _ = sender.send(to_send);
+                    *is_complete_clone.lock() = true;
+
+                    unregister_task(&task_id_clone);
+                    clear_task_progress(&task_id_clone);
+                    TASK_DEPENDENCIES.remove(&task_id_clone);
+                    set_current_task_id(None);
+                });
+            })
+        });
+
+        let async_handle = AsyncHandle {
+            receiver: Arc::new(Mutex::new(receiver)),
+            thread_handle: Arc::new(Mutex::new(Some(handle))),
+            is_complete,
+            result_cache: Arc::new(Mutex::new(None)),
+            cancel_token,
+            func_name,
+            start_time,
+            task_id,
+            metadata: Arc::new(Mutex::new(HashMap::new())),
+            timeout,
+            on_complete: Arc::new(Mutex::new(None)),
+            on_error: Arc::new(Mutex::new(None)),
+            on_progress: Arc::new(Mutex::new(None)),
+        };
+
+        Py::new(py, async_handle)
+    }
+}
+
+/// Decorator for parallel execution with dependency support
+#[pyfunction]
+fn parallel_with_deps(py: Python, func: Py<PyAny>) -> PyResult<Py<ParallelWithDeps>> {
+    Py::new(py, ParallelWithDeps { func })
 }
 
 /// Optimized parallel wrapper using crossbeam channels
@@ -1417,7 +1891,7 @@ impl PriorityParallelWrapper {
         let func = self.func.clone_ref(py);
 
         // Generate unique task ID
-        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let task_id = format!("task_{}", TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
         let task_id_clone = task_id.clone();
 
         // Register task as active
@@ -1446,7 +1920,7 @@ impl PriorityParallelWrapper {
             let cancel_token_timeout = cancel_token.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs_f64(timeout_secs));
-                cancel_token_timeout.store(true, Ordering::SeqCst);
+                cancel_token_timeout.store(true, Ordering::Release);
             });
         }
 
@@ -1806,9 +2280,307 @@ fn retry_cached(_py: Python<'_>, max_attempts: usize, cache_failures: bool) -> P
     Ok(decorator.into())
 }
 
+// =============================================================================
+// UNIT TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thread_local_task_id() {
+        // Test that thread-local storage works
+        assert_eq!(
+            CURRENT_TASK_ID.with(|id| id.borrow().clone()),
+            None,
+            "Initial task_id should be None"
+        );
+
+        // Set task_id
+        set_current_task_id(Some("test_task_123".to_string()));
+
+        assert_eq!(
+            CURRENT_TASK_ID.with(|id| id.borrow().clone()),
+            Some("test_task_123".to_string()),
+            "Task_id should be set"
+        );
+
+        // Clear task_id
+        set_current_task_id(None);
+
+        assert_eq!(
+            CURRENT_TASK_ID.with(|id| id.borrow().clone()),
+            None,
+            "Task_id should be cleared"
+        );
+    }
+
+    #[test]
+    fn test_thread_isolation() {
+        // Test that thread-local storage is isolated between threads
+        use std::thread;
+        use std::sync::mpsc::channel;
+
+        let (tx1, rx1) = channel();
+        let (tx2, rx2) = channel();
+
+        // Thread 1
+        let handle1 = thread::spawn(move || {
+            set_current_task_id(Some("thread1_task".to_string()));
+            let id = CURRENT_TASK_ID.with(|id| id.borrow().clone());
+            tx1.send(id).unwrap();
+        });
+
+        // Thread 2
+        let handle2 = thread::spawn(move || {
+            set_current_task_id(Some("thread2_task".to_string()));
+            let id = CURRENT_TASK_ID.with(|id| id.borrow().clone());
+            tx2.send(id).unwrap();
+        });
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+
+        let thread1_id = rx1.recv().unwrap();
+        let thread2_id = rx2.recv().unwrap();
+
+        assert_eq!(thread1_id, Some("thread1_task".to_string()));
+        assert_eq!(thread2_id, Some("thread2_task".to_string()));
+        assert_ne!(thread1_id, thread2_id, "Thread IDs should be independent");
+    }
+
+    #[test]
+    fn test_task_progress_map_insert_and_get() {
+        // Test basic progress tracking
+        let task_id = "test_progress_task";
+
+        // Insert progress
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 0.5);
+
+        // Retrieve progress
+        let progress = TASK_PROGRESS_MAP.get(task_id).map(|p| *p);
+        assert_eq!(progress, Some(0.5));
+
+        // Update progress
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 0.75);
+        let updated_progress = TASK_PROGRESS_MAP.get(task_id).map(|p| *p);
+        assert_eq!(updated_progress, Some(0.75));
+
+        // Clean up
+        clear_task_progress(task_id);
+        assert_eq!(TASK_PROGRESS_MAP.get(task_id).map(|p| *p), None);
+    }
+
+    #[test]
+    fn test_clear_task_progress() {
+        // Test progress cleanup
+        let task_id = "cleanup_test_task";
+
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 1.0);
+        assert!(TASK_PROGRESS_MAP.contains_key(task_id));
+
+        clear_task_progress(task_id);
+        assert!(!TASK_PROGRESS_MAP.contains_key(task_id));
+    }
+
+    #[test]
+    fn test_multiple_tasks_progress() {
+        // Test multiple tasks tracking progress independently
+        let task1 = "multi_task_1";
+        let task2 = "multi_task_2";
+        let task3 = "multi_task_3";
+
+        TASK_PROGRESS_MAP.insert(task1.to_string(), 0.3);
+        TASK_PROGRESS_MAP.insert(task2.to_string(), 0.6);
+        TASK_PROGRESS_MAP.insert(task3.to_string(), 0.9);
+
+        assert_eq!(TASK_PROGRESS_MAP.get(task1).map(|p| *p), Some(0.3));
+        assert_eq!(TASK_PROGRESS_MAP.get(task2).map(|p| *p), Some(0.6));
+        assert_eq!(TASK_PROGRESS_MAP.get(task3).map(|p| *p), Some(0.9));
+
+        // Clean up
+        clear_task_progress(task1);
+        clear_task_progress(task2);
+        clear_task_progress(task3);
+    }
+
+    #[test]
+    fn test_task_id_counter_increments() {
+        // Test that task ID counter increments
+        let start = TASK_ID_COUNTER.load(Ordering::SeqCst);
+
+        let id1 = TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let id2 = TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let id3 = TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(id2, id1 + 1);
+        assert_eq!(id3, id2 + 1);
+        assert!(id1 >= start);
+    }
+
+    #[test]
+    fn test_active_tasks_registration() {
+        // Test task registration and unregistration
+        let initial_count = get_active_task_count();
+
+        register_task("test_task_reg_1".to_string());
+        assert_eq!(get_active_task_count(), initial_count + 1);
+
+        register_task("test_task_reg_2".to_string());
+        assert_eq!(get_active_task_count(), initial_count + 2);
+
+        unregister_task("test_task_reg_1");
+        assert_eq!(get_active_task_count(), initial_count + 1);
+
+        unregister_task("test_task_reg_2");
+        assert_eq!(get_active_task_count(), initial_count);
+    }
+
+    #[test]
+    fn test_shutdown_flag() {
+        // Test shutdown flag operations
+        reset_shutdown().unwrap();
+        assert!(!is_shutdown_requested());
+
+        SHUTDOWN_FLAG.store(true, Ordering::Release);
+        assert!(is_shutdown_requested());
+
+        reset_shutdown().unwrap();
+        assert!(!is_shutdown_requested());
+    }
+
+    #[test]
+    fn test_progress_boundaries() {
+        // Test progress values at boundaries
+        let task_id = "boundary_task";
+
+        // Test 0.0
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 0.0);
+        assert_eq!(TASK_PROGRESS_MAP.get(task_id).map(|p| *p), Some(0.0));
+
+        // Test 1.0
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 1.0);
+        assert_eq!(TASK_PROGRESS_MAP.get(task_id).map(|p| *p), Some(1.0));
+
+        // Test middle value
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 0.5);
+        assert_eq!(TASK_PROGRESS_MAP.get(task_id).map(|p| *p), Some(0.5));
+
+        clear_task_progress(task_id);
+    }
+
+    #[test]
+    fn test_concurrent_progress_updates() {
+        use std::thread;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Test concurrent progress updates from multiple threads
+        let task_id_base = "concurrent_test";
+        let num_threads = 10;
+        let updates_per_thread = 100;
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let counter = counter.clone();
+                thread::spawn(move || {
+                    let task_id = format!("{}_{}", task_id_base, i);
+                    for j in 0..updates_per_thread {
+                        let progress = (j as f64) / (updates_per_thread as f64);
+                        TASK_PROGRESS_MAP.insert(task_id.clone(), progress);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    clear_task_progress(&task_id);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            num_threads * updates_per_thread,
+            "All progress updates should complete"
+        );
+    }
+
+    #[test]
+    fn test_memory_cleanup() {
+        // Test that cleanup actually removes entries
+        let task_id = "memory_cleanup_test";
+
+        // Add progress
+        TASK_PROGRESS_MAP.insert(task_id.to_string(), 0.5);
+        assert!(TASK_PROGRESS_MAP.contains_key(task_id));
+
+        // Clear progress
+        clear_task_progress(task_id);
+
+        // Verify it's gone
+        assert!(!TASK_PROGRESS_MAP.contains_key(task_id));
+        assert_eq!(TASK_PROGRESS_MAP.get(task_id).map(|p| *p), None);
+    }
+
+    #[test]
+    fn test_task_metrics_recording() {
+        // Test that task execution recording works
+        reset_metrics().unwrap();
+
+        let func_name = "test_function";
+        let duration_ms = 100.0;
+
+        // Record successful execution
+        record_task_execution(func_name, duration_ms, true);
+
+        // Verify counters
+        assert_eq!(TASK_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(COMPLETED_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(FAILED_COUNTER.load(Ordering::SeqCst), 0);
+
+        // Record failed execution
+        record_task_execution(func_name, duration_ms, false);
+
+        assert_eq!(TASK_COUNTER.load(Ordering::SeqCst), 2);
+        assert_eq!(COMPLETED_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(FAILED_COUNTER.load(Ordering::SeqCst), 1);
+
+        // Clean up
+        reset_metrics().unwrap();
+    }
+
+    #[test]
+    fn test_max_concurrent_tasks() {
+        // Test setting concurrent task limit
+        set_max_concurrent_tasks(5).unwrap();
+        assert_eq!(*MAX_CONCURRENT_TASKS.lock(), Some(5));
+
+        set_max_concurrent_tasks(10).unwrap();
+        assert_eq!(*MAX_CONCURRENT_TASKS.lock(), Some(10));
+    }
+
+    #[test]
+    fn test_check_memory_ok() {
+        // Test memory checking (currently always returns true)
+        assert!(check_memory_ok());
+
+        // Set memory limit
+        configure_memory_limit(75.0).unwrap();
+
+        // Still returns true (actual memory checking not implemented)
+        assert!(check_memory_ok());
+    }
+}
+
 /// This module is implemented in Rust.
 #[pymodule]
 fn makeparallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize logging (only once)
+    let _ = env_logger::try_init();
+
     // Original decorators
     m.add_function(wrap_pyfunction!(timer, m)?)?;
     m.add_class::<CallCounter>()?;
@@ -1852,12 +2624,17 @@ fn makeparallel(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Progress tracking
     m.add_function(wrap_pyfunction!(report_progress, m)?)?;
+    m.add_function(wrap_pyfunction!(get_current_task_id, m)?)?;
 
     // Helper functions
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_class::<ParallelContext>()?;
     m.add_function(wrap_pyfunction!(retry_backoff, m)?)?;
     m.add_function(wrap_pyfunction!(retry_cached, m)?)?;
+
+    // Task dependencies
+    m.add_function(wrap_pyfunction!(parallel_with_deps, m)?)?;
+    m.add_class::<ParallelWithDeps>()?;
 
     Ok(())
 }
