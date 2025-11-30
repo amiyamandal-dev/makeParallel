@@ -62,7 +62,7 @@ pip install makeparallel
 Or, to build it from the source:
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/makeParallel.git
+git clone https://github.com/amiyamandal-dev/makeParallel.git
 cd makeParallel
 
 # Build and install locally
@@ -639,7 +639,7 @@ Contributions are welcome! If you want to help improve `makeParallel`, please fe
 ### Development Setup
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/makeParallel.git
+git clone https://github.com/amiyamandal-dev/makeParallel.git
 cd makeParallel
 
 # Create virtual environment
@@ -696,9 +696,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📬 Contact & Support
 
-- **Issues**: [GitHub Issues](https://github.com/your-username/makeParallel/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/makeParallel/discussions)
+- **Issues**: [GitHub Issues](https://github.com/amiyamandal-dev/makeParallel/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/amiyamandal-dev/makeParallel/discussions)
 - **PyPI**: [pypi.org/project/makeparallel](https://pypi.org/project/makeparallel/)
+- **Author**: Amiya Mandal - [GitHub](https://github.com/amiyamandal-dev)
 
 ---
 

@@ -4,10 +4,50 @@ build-backend = "maturin"
 
 [project]
 name = "makeparallel"
+version = "0.1.0"
+description = "True parallelism for Python - Bypass the GIL with Rust-powered decorators for CPU-bound tasks"
+readme = "README.md"
 requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Amiya Mandal", email = "amiya19mandal@gmail.com" }
+]
+maintainers = [
+    { name = "Amiya Mandal", email = "amiya19mandal@gmail.com" }
+]
+keywords = [
+    "parallel",
+    "concurrency",
+    "gil",
+    "rust",
+    "performance",
+    "threading",
+    "multicore",
+    "cpu-bound",
+    "decorator"
+]
 classifiers = [
-    "Programming Language :: Rust",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Hardware :: Symmetric Multi-processing",
 ]
-dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/amiyamandal-dev/makeParallel"
+Documentation = "https://github.com/amiyamandal-dev/makeParallel#readme"
+Repository = "https://github.com/amiyamandal-dev/makeParallel"
+"Bug Tracker" = "https://github.com/amiyamandal-dev/makeParallel/issues"
+Changelog = "https://github.com/amiyamandal-dev/makeParallel/releases"
